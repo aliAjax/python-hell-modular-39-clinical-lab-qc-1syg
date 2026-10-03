@@ -147,14 +147,43 @@ def _validate_evaluate(actor, entity, data, lookup):
     if not result["accepted"] and not data.get("reject_reason"):
         result["reject_reason"] = "quality control rule violation"
     result["_next_status"] = "accepted" if result["accepted"] else "rejected"
+    result["evaluated_by"] = data.get("evaluated_by")
     return result
 
 
 def _validate_release(actor, entity, data, lookup):
     run = _find_one(lookup, "qc_run", "id", entity["data"].get("qc_run_id"))
     instrument = _find_one(lookup, "instrument", "id", entity["data"].get("instrument_id"))
+    # Freeze blockers are checked before the status guard so a batch held in
+    # "intercepted" reports the latest blocking items to the late reviewer.
+    blocking = _active_freezes_for(
+        lookup,
+        entity["data"].get("assay_id"),
+        entity["data"].get("instrument_id"),
+    )
+    if blocking:
+        freeze = blocking[0]
+        held = [
+            batch["id"]
+            for batch in (lookup("result_batch", "assay_id", entity["data"].get("assay_id")) or [])
+            if batch["status"] == "intercepted"
+            and batch["data"].get("instrument_id") in freeze["data"].get("instrument_ids", [])
+            and freeze["id"] in batch["data"].get("freeze_order_ids", [])
+        ]
+        raise ConflictError(
+            "result batch is blocked by active freeze order %s" % freeze["id"],
+            details={
+                "freeze_order_id": freeze["id"],
+                "freeze_status": freeze["status"],
+                "instrument_ids": list(freeze["data"].get("instrument_ids", [])),
+                "blocking_holds": held,
+                "reviewed_by": freeze["data"].get("reviewed_by"),
+            },
+        )
     if not run or run["status"] != "accepted":
         raise ConflictError("result batch can only be released with an accepted QC run")
+    if entity["status"] == "intercepted":
+        raise ConflictError("intercepted result batch must be lifted or retested before release")
     if not instrument or instrument["status"] != "ready":
         raise ConflictError("instrument is not ready")
     if not calibration_is_valid(instrument["data"].get("calibration_due"), entity["data"].get("run_at")):
@@ -166,6 +195,33 @@ def _validate_release(actor, entity, data, lookup):
     if active_holds:
         raise ConflictError("an intercepted result batch must be resolved first")
     return {"released_by": actor.user_id}
+
+
+def _active_freezes_for(lookup, assay_id, instrument_id):
+    active = []
+    for freeze in lookup("freeze_order", "assay_id", assay_id) or []:
+        if freeze["status"] == "recovered":
+            continue
+        if instrument_id in freeze["data"].get("instrument_ids", []):
+            active.append(freeze)
+    active.sort(key=lambda item: item["created_at"])
+    return active
+
+
+def _validate_freeze_review(actor, entity, data, lookup):
+    decision = data.get("decision")
+    if decision not in ("approved", "rejected"):
+        raise ValidationError("review decision must be approved or rejected")
+    if decision == "rejected" and not str(data.get("comment", "")).strip():
+        raise ValidationError("a rejected review requires a comment")
+    if actor.user_id == entity["data"].get("opened_by"):
+        raise PermissionDenied("the opener of a freeze order cannot review it")
+    return {
+        "_next_status": "reviewed" if decision == "approved" else "review_rejected",
+        "decision": decision,
+        "reviewed_by": actor.user_id,
+        "review_comment": data.get("comment"),
+    }
 
 
 def _validate_qc_retest(actor, entity, data, lookup):
@@ -201,6 +257,7 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "freeze_orders": "freeze_order",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -234,12 +291,15 @@ class RuleEngine:
             "correct": (("accepted", "rejected", "investigated", "resolved"), "pending"),
         },
         "result_batch": {
-            "release": (("waiting",), "released"),
+            "release": (("waiting", "intercepted"), "released"),
             "intercept": (("waiting",), "intercepted"),
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+        },
+        "freeze_order": {
+            "review": (("frozen", "review_rejected"), "reviewed"),
         },
     }
     CREATE_REQUIRED = {
@@ -268,6 +328,7 @@ class RuleEngine:
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
         ("result_batch", "correct"): ("reason",),
+        ("freeze_order", "review"): ("reviewer_id", "decision"),
     }
     CREATE_ROLES = {
         "assay": ("supervisor", "admin"),
@@ -292,6 +353,7 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "review": ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -307,6 +369,7 @@ class RuleEngine:
         ("qc_lot", "switch_in"): _validate_switch_lot,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,
+        ("freeze_order", "review"): _validate_freeze_review,
     }
 
     def normalize_kind(self, kind):
@@ -354,7 +417,5 @@ class RuleEngine:
         extra = custom(actor, entity, data, lookup) if custom else {}
         if extra.get("_next_status"):
             next_status = extra.pop("_next_status")
-        patch = dict(data)
-        if extra:
-            patch.update(extra)
+        patch = extra if custom else dict(data)
         return next_status, patch
