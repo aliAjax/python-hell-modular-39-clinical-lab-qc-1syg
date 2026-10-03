@@ -34,6 +34,23 @@ python3 app.py --db ./data.db --port 8339
 
 身份通过`X-User-Id`和`X-Role`请求头传入。可选`Idempotency-Key`防止重复创建。
 
+## 隔离与恢复流程
+
+质控品批次被同一检测项目的多台仪器共用。某台仪器连续偏差时，按批号冻结整批，同批号的其他仪器和待放行患者结果批次一起拦住，复核通过后才放行；已放行批次保留原记录和依据。
+
+- `POST /api/freeze-orders`：按`qc_lot_id`和`reason`建冻结单。同一批号同一原因只建一份，复用未解除的同原因冻结单；自动找出该批号下受影响仪器和待放行批次，逐项写入冻结项。
+- `GET /api/freeze-orders`、`GET /api/freeze-orders/<id>`：查看冻结单及其冻结项。
+- `POST /api/freeze-orders/<id>/review`：复核通过，解除该单下所有阻塞项。
+- `GET /api/freeze-items?freeze_order_id=`：查看冻结项。
+- `POST /api/backfill/lot-relationships`：旧质控没有共享批号关系时，按单仪器范围补全`qc_lot_id`。
+
+质控结果评估为连续偏差（`bias_high`/`bias_low`/`trend_up`/`trend_down`）时自动触发冻结。放行校验会检查批号是否有未解除的冻结单或阻塞项。
+
+### 并发与重试
+
+- 复核和放行使用乐观锁：提交时带`expected_version`，版本过期者收到`409`并在`details`中看到最新冻结单与阻塞项，只有一个成功。
+- 冻结项逐项写入，每项独立事务。写入失败后已完成项保留；重试只补未完成项，不重复写审计。
+
 ## 测试
 
 ```bash

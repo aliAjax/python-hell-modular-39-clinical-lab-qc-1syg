@@ -70,7 +70,10 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            if getattr(exc, "details", None):
+                payload["details"] = exc.details
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -84,6 +87,14 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "freeze-orders"]:
+                    return self._send(200, {"items": service.list_freeze_orders()})
+                if len(parts) == 3 and parts[:2] == ["api", "freeze-orders"]:
+                    return self._send(200, service.get_freeze_order(parts[2]))
+                if parts == ["api", "freeze-items"]:
+                    query = parse_qs(parsed.query)
+                    order_id = query.get("freeze_order_id", [None])[0]
+                    return self._send(200, {"items": service.list_freeze_items(order_id)})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -138,6 +149,32 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if parts == ["api", "freeze-orders"]:
+                    body = self._body()
+                    return self._send(
+                        201,
+                        service.create_freeze_order(
+                            actor,
+                            body.get("qc_lot_id"),
+                            body.get("reason"),
+                            body.get("scope", "lot"),
+                            body.get("instrument_id"),
+                            self.headers.get("Idempotency-Key"),
+                        ),
+                    )
+                if len(parts) == 4 and parts[:2] == ["api", "freeze-orders"] and parts[3] == "review":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.review_freeze_order(
+                            actor,
+                            parts[2],
+                            body.get("review_note"),
+                            body.get("expected_version"),
+                        ),
+                    )
+                if len(parts) == 3 and parts[0] == "api" and parts[1] == "backfill" and parts[2] == "lot-relationships":
+                    return self._send(200, service.backfill_lot_relationships(actor))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(

@@ -1,4 +1,10 @@
+from datetime import datetime, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _find_one(lookup, kind, field, value):
@@ -165,6 +171,33 @@ def _validate_release(actor, entity, data, lookup):
             active_holds.append(batch)
     if active_holds:
         raise ConflictError("an intercepted result batch must be resolved first")
+    # 隔离：批号被冻结单覆盖时，复核通过前不得放行
+    lot_id = run["data"].get("qc_lot_id")
+    if lot_id:
+        active_orders = [
+            order for order in (lookup("freeze_order", "qc_lot_id", lot_id) or [])
+            if order["status"] == "active"
+        ]
+        if active_orders:
+            raise ConflictError(
+                "result batch is held by an active freeze order",
+                details={"freeze_orders": active_orders},
+            )
+        blocked_items = [
+            item for item in (lookup("freeze_item", "qc_lot_id", lot_id) or [])
+            if item["status"] == "blocked"
+            and (
+                (item["data"].get("target_type") == "result_batch"
+                 and item["data"].get("target_id") == entity["id"])
+                or (item["data"].get("target_type") == "instrument"
+                    and item["data"].get("target_id") == entity["data"].get("instrument_id"))
+            )
+        ]
+        if blocked_items:
+            raise ConflictError(
+                "result batch is blocked by a freeze item",
+                details={"freeze_items": blocked_items},
+            )
     return {"released_by": actor.user_id}
 
 
@@ -194,6 +227,64 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_freeze_order(actor, data, lookup):
+    lot = _find_one(lookup, "qc_lot", "id", data.get("qc_lot_id"))
+    if not lot:
+        raise ValidationError("qc lot does not exist")
+    reason = str(data.get("reason", "")).strip()
+    if not reason:
+        raise ValidationError("freeze reason is required")
+    scope = data.get("scope", "lot")
+    if scope not in ("lot", "instrument"):
+        raise ValidationError("scope must be lot or instrument")
+    return {
+        "qc_lot_id": data["qc_lot_id"],
+        "reason": reason,
+        "reason_key": "%s::%s" % (data["qc_lot_id"], reason),
+        "scope": scope,
+        "instrument_id": data.get("instrument_id"),
+    }
+
+
+def _validate_freeze_item(actor, data, lookup):
+    order = _find_one(lookup, "freeze_order", "id", data.get("freeze_order_id"))
+    if not order:
+        raise ValidationError("freeze order does not exist")
+    target_type = data.get("target_type")
+    if target_type not in ("instrument", "result_batch"):
+        raise ValidationError("target_type must be instrument or result_batch")
+    target_kind = "instrument" if target_type == "instrument" else "result_batch"
+    target = _find_one(lookup, target_kind, "id", data.get("target_id"))
+    if not target:
+        raise ValidationError("freeze target does not exist")
+    if target_type == "instrument":
+        instrument_id = target["id"]
+    else:
+        instrument_id = target["data"].get("instrument_id")
+    return {
+        "freeze_order_id": order["id"],
+        "item_key": "%s:%s:%s" % (order["id"], target_type, data["target_id"]),
+        "target_type": target_type,
+        "target_id": data["target_id"],
+        "qc_lot_id": data.get("qc_lot_id") or order["data"].get("qc_lot_id"),
+        "instrument_id": data.get("instrument_id") or instrument_id,
+        "reason": order["data"].get("reason"),
+    }
+
+
+def _validate_review_freeze(actor, entity, data, lookup):
+    if entity["status"] != "active":
+        raise InvalidTransition("freeze order is not active")
+    note = data.get("review_note")
+    return {
+        "reviewer_id": actor.user_id,
+        "review_note": note,
+        "reviewed_at": utcnow(),
+        "release_basis": note or ("review by " + actor.user_id),
+        "released_at": utcnow(),
+    }
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -201,6 +292,8 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "freeze_orders": "freeze_order",
+        "freeze_items": "freeze_item",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +301,8 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "freeze_order": "active",
+        "freeze_item": "blocked",
     }
     TRANSITIONS = {
         "assay": {
@@ -241,6 +336,12 @@ class RuleEngine:
             "resolve": (("investigating",), "resolved"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
         },
+        "freeze_order": {
+            "review": (("active",), "released"),
+        },
+        "freeze_item": {
+            "release": (("blocked",), "released"),
+        },
     }
     CREATE_REQUIRED = {
         "assay": ("name", "unit", "allowed_low", "allowed_high"),
@@ -248,6 +349,8 @@ class RuleEngine:
         "instrument": ("name", "serial", "calibration_due"),
         "qc_run": ("assay_id", "qc_lot_id", "instrument_id", "value", "run_at"),
         "result_batch": ("assay_id", "instrument_id", "qc_run_id", "run_at", "patient_count"),
+        "freeze_order": ("qc_lot_id", "reason"),
+        "freeze_item": ("freeze_order_id", "target_type", "target_id", "qc_lot_id"),
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
@@ -268,6 +371,7 @@ class RuleEngine:
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
         ("result_batch", "correct"): ("reason",),
+        ("freeze_order", "review"): ("reviewer_id",),
     }
     CREATE_ROLES = {
         "assay": ("supervisor", "admin"),
@@ -275,6 +379,8 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "freeze_order": ("supervisor", "admin"),
+        "freeze_item": ("supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -292,6 +398,7 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "review": ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -299,6 +406,8 @@ class RuleEngine:
         "instrument": _validate_instrument,
         "qc_run": _validate_qc_run,
         "result_batch": _validate_result_batch,
+        "freeze_order": _validate_freeze_order,
+        "freeze_item": _validate_freeze_item,
     }
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,
@@ -307,6 +416,7 @@ class RuleEngine:
         ("qc_lot", "switch_in"): _validate_switch_lot,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,
+        ("freeze_order", "review"): _validate_review_freeze,
     }
 
     def normalize_kind(self, kind):
